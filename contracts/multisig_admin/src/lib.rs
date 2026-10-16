@@ -19,6 +19,7 @@ use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
     Env, Symbol, TryIntoVal, Val, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 
 // ---------------------------------------------------------------------------
@@ -45,6 +46,8 @@ pub enum Error {
     InvalidEmergencySignatures = 13,
     /// Duplicate or unregistered emergency signer in aggregation.
     InvalidEmergencySigner = 14,
+    /// Stored proposal arguments no longer match the checksum captured at proposal time.
+    ProposalArgsTampered = 15,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +88,8 @@ pub enum DataKey {
     ProposalCount,
     Signer(Address),
     Proposal(u32),
+    /// SHA-256 checksum of the proposal argument XDR captured at proposal time.
+    ProposalArgsChecksum(u32),
     Approval(u32, Address),
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
@@ -204,6 +209,7 @@ impl MultisigAdminContract {
             return Err(Error::NotSigner);
         }
         proposer.require_auth();
+        let args_checksum = compute_checksum(&env, &args.clone().to_xdr(&env));
         let count: u32 = env.storage().instance().get(&DataKey::ProposalCount).unwrap_or(0);
         let new_id = count.checked_add(1).expect("proposal count overflow");
         env.storage().instance().set(&DataKey::ProposalCount, &new_id);
@@ -220,6 +226,9 @@ impl MultisigAdminContract {
             cancelled: false,
         };
         env.storage().persistent().set(&DataKey::Proposal(new_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalArgsChecksum(new_id), &args_checksum);
         env.storage().persistent().set(&DataKey::Approval(new_id, proposer.clone()), &true);
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("proposed"), new_id),
@@ -282,6 +291,15 @@ impl MultisigAdminContract {
         if env.ledger().timestamp() > proposal.expiry { return Err(Error::Expired); }
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
         if proposal.approval_count < threshold { return Err(Error::BelowThreshold); }
+        let stored_checksum: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalArgsChecksum(action_id))
+            .ok_or(Error::ProposalArgsTampered)?;
+        let computed_checksum = compute_checksum(&env, &proposal.args.clone().to_xdr(&env));
+        if computed_checksum != stored_checksum {
+            return Err(Error::ProposalArgsTampered);
+        }
 
         // Mark executed before dispatch (prevents re-entrancy)
         proposal.executed = true;
@@ -1412,6 +1430,27 @@ mod test {
 
         f.client().sign_action(&f.signers[1], &pid);
         assert_eq!(f.client().try_execute_action(&pid), Err(Ok(Error::BelowThreshold)));
+    }
+
+    #[test]
+    fn test_execute_rejects_tampered_proposal_args() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        let pid = f.propose(&target, "do_thing");
+        f.sign_n(pid, 3);
+
+        f.env.as_contract(&f.contract, || {
+            let mut proposal: ProposalRecord = f
+                .env
+                .storage()
+                .persistent()
+                .get(&DataKey::Proposal(pid))
+                .unwrap();
+            proposal.args = vec![&f.env, 7u32.into_val(&f.env)];
+            f.env.storage().persistent().set(&DataKey::Proposal(pid), &proposal);
+        });
+
+        assert_eq!(f.client().try_execute_action(&pid), Err(Ok(Error::ProposalArgsTampered)));
     }
 
     #[test]
