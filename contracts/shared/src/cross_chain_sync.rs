@@ -969,6 +969,92 @@ mod tests {
     }
 
     #[test]
+    fn test_rollback_flow_reaches_rolled_back() {
+        let (env, contract_id) = env_at(1_000);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, dummy_chains(&env), dummy_root(&env, 0x31))
+                .expect("begin ok");
+
+            initiate_rollback(&env, &op_id).expect("rollback initiated");
+            assert_eq!(get_xchain_op(&env, &op_id).unwrap().phase, XChainPhase::RollingBack);
+
+            confirm_rollback(&env, &op_id).expect("rollback confirmed");
+            assert_eq!(get_xchain_op(&env, &op_id).unwrap().phase, XChainPhase::RolledBack);
+        });
+    }
+
+    #[test]
+    fn test_confirm_rollback_requires_rolling_back_phase() {
+        let (env, contract_id) = env_at(1_000);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, dummy_chains(&env), dummy_root(&env, 0x32))
+                .expect("begin ok");
+
+            // Still Prepared: confirming a rollback that never started must fail.
+            assert_eq!(confirm_rollback(&env, &op_id), Err(XChainSyncError::AlreadyTerminal));
+            assert_eq!(get_xchain_op(&env, &op_id).unwrap().phase, XChainPhase::Prepared);
+        });
+    }
+
+    #[test]
+    fn test_committed_op_rejects_further_transitions() {
+        let (env, contract_id) = env_at(1_000);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let root = dummy_root(&env, 0x33);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, dummy_chains(&env), root.clone())
+                .expect("begin ok");
+            acknowledge_prepare(&env, &op_id, 2).unwrap();
+            acknowledge_prepare(&env, &op_id, 1).unwrap();
+            confirm_commit(&env, &op_id, 2, root.clone()).unwrap();
+            confirm_commit(&env, &op_id, 1, root).unwrap();
+
+            // Committed is terminal: no late acks, rollbacks, or expiry.
+            assert_eq!(acknowledge_prepare(&env, &op_id, 1), Err(XChainSyncError::AlreadyTerminal));
+            assert_eq!(initiate_rollback(&env, &op_id), Err(XChainSyncError::AlreadyTerminal));
+            assert_eq!(get_xchain_op(&env, &op_id).unwrap().phase, XChainPhase::Committed);
+        });
+    }
+
+    #[test]
+    fn test_rolled_back_op_rejects_commit_confirmation() {
+        let (env, contract_id) = env_at(1_000);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, dummy_chains(&env), dummy_root(&env, 0x34))
+                .expect("begin ok");
+            initiate_rollback(&env, &op_id).unwrap();
+            confirm_rollback(&env, &op_id).unwrap();
+
+            assert_eq!(
+                confirm_commit(&env, &op_id, 2, dummy_root(&env, 0x34)),
+                Err(XChainSyncError::AlreadyTerminal)
+            );
+            assert_eq!(get_xchain_op(&env, &op_id).unwrap().phase, XChainPhase::RolledBack);
+        });
+    }
+
+    #[test]
+    fn test_expire_before_timeout_is_rejected() {
+        let (env, contract_id) = env_at(1_000);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, dummy_chains(&env), dummy_root(&env, 0x35))
+                .expect("begin ok");
+
+            assert_eq!(expire_xchain_op(&env, &op_id), Err(XChainSyncError::Expired));
+            assert_eq!(get_xchain_op(&env, &op_id).unwrap().phase, XChainPhase::Prepared);
+        });
+    }
+
+    #[test]
     fn test_op_expiry() {
         let (env, contract_id) = env_at(1_000);
         env.mock_all_auths();
