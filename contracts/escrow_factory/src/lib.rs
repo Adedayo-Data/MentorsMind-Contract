@@ -11,6 +11,7 @@ use shared::GasEstimate;
 use shared::dynamic_fees::{calculate_dynamic_fee, DynamicFeeResult};
 use shared::health_reporter::{report_metric, MetricCategory};
 use shared::CrossContractAuth;
+use shared::platform_authenticity::{detect_fee_evasion, PenaltyTier};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -45,6 +46,7 @@ const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
 const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
 const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
 const HEALTH_DASHBOARD: Symbol = symbol_short!("HLTH_DB");
+pub const DEP_HIST: Symbol = symbol_short!("DEP_HIST");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
 
@@ -285,6 +287,16 @@ impl EscrowFactory {
         if !CrossContractAuth::verify_caller(&env, &admin) {
             panic_with_error!(&env, Error::Unauthorized);
         }
+
+        // Fee evasion check for the deploying learner
+        let fee_bps = Self::calculate_escrow_fees(&env, 0, 100);
+        let expected_fee = if amount > 0 {
+            (amount * fee_bps as i128) / 10_000
+        } else {
+            100_000
+        };
+        let expected_fee = if expected_fee == 0 { 100_000 } else { expected_fee };
+        Self::check_fee_evasion(&env, &learner, expected_fee);
 
         // Check pause guardian
         if let Some(guardian) = env.storage().persistent().get::<_, Address>(&PAUSE_GUARDIAN) {
@@ -765,7 +777,34 @@ impl EscrowFactory {
 
     pub fn validate_fee_payments(env: &Env, expected_bps: u32, provided_bps: u32) -> bool {
         // Allow a tiny rounding tolerance if needed, but normally should exactly match
+        let _ = env;
         expected_bps == provided_bps
+    }
+
+    pub fn check_fee_evasion(env: &Env, learner: &Address, expected_fee: i128) {
+        let key = (DEP_HIST, learner.clone());
+        let (count, total_fee): (u32, i128) = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .unwrap_or((0, 0));
+
+        if count > 0 {
+            let actual_avg = total_fee / (count as i128);
+            let audit = detect_fee_evasion(env, expected_fee, actual_avg);
+            if audit.penalty_tier == PenaltyTier::Permanent
+                || audit.penalty_tier == PenaltyTier::PermanentBan
+            {
+                panic_with_error!(env, Error::Unauthorized);
+            }
+        }
+
+        let new_count = count.saturating_add(1);
+        let new_fee = total_fee.saturating_add(expected_fee);
+        env.storage().temporary().set(&key, &(new_count, new_fee));
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
     // -----------------------------------------------------------------------
@@ -858,7 +897,12 @@ impl EscrowFactory {
     /// beforehand.
     fn deploy_minimal_proxy(env: &Env, implementation: &Address, salt: BytesN<32>) -> Address {
         let _ = implementation;
-        env.deployer().with_current_contract(salt).deployed_address()
+        let addr = env.deployer().with_current_contract(salt).deployed_address();
+        #[cfg(test)]
+        {
+            let _ = env.register_contract(Some(&addr), MockEscrow);
+        }
+        addr
     }
 
     /// Get admin address (internal helper)
@@ -879,6 +923,35 @@ impl EscrowFactory {
         if *caller != Self::admin(env) {
             panic!("Unauthorized");
         }
+    }
+}
+
+#[cfg(test)]
+#[contract]
+pub struct MockEscrow;
+
+#[cfg(test)]
+#[contractimpl]
+impl MockEscrow {
+    pub fn initialize(
+        _env: Env,
+        _admin: Address,
+        _treasury: Address,
+        _fee_bps: u32,
+        _approved_tokens: Vec<Address>,
+        _auto_release_delay: u64,
+    ) {}
+
+    pub fn create_escrow(
+        env: Env,
+        _mentor: Address,
+        _learner: Address,
+        _amount: i128,
+        _session_id: Symbol,
+        _token: Address,
+        _session_end: u64,
+    ) -> Address {
+        env.current_contract_address()
     }
 }
 

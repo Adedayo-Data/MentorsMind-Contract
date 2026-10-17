@@ -180,6 +180,8 @@ pub enum XChainSyncError {
     InsufficientFinality = 8,
     /// Reorg protection: operation is too recent for the configured safe depth.
     ReorgUnsafe = 9,
+    /// Operation with this ID already exists.
+    DuplicateOp = 10,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +226,11 @@ pub fn begin_atomic_xchain_op(
     }
     let op_id: BytesN<32> = env.crypto().sha256(&payload).into();
 
+    let key = xchain_op_key(&op_id);
+    if env.storage().persistent().has(&key) {
+        return Err(XChainSyncError::DuplicateOp);
+    }
+
     let op = AtomicXChainOp {
         op_id: op_id.clone(),
         chain_ids: participating_chains,
@@ -236,7 +243,6 @@ pub fn begin_atomic_xchain_op(
         expected_state_root,
     };
 
-    let key = xchain_op_key(&op_id);
     env.storage().persistent().set(&key, &op);
 
     env.events().publish(
@@ -686,6 +692,33 @@ pub fn expire_xchain_op(env: &Env, op_id: &BytesN<32>) -> Result<(), XChainSyncE
     Ok(())
 }
 
+/// Clean up an expired operation from persistent storage.
+///
+/// Removes the operation if its timeout has passed. Returns Err(XChainSyncError::Expired)
+/// if the operation has not yet reached its timeout.
+pub fn cleanup_expired_op(env: &Env, op_id: &BytesN<32>) -> Result<(), XChainSyncError> {
+    let key = xchain_op_key(op_id);
+    let op: AtomicXChainOp = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(XChainSyncError::OpNotFound)?;
+
+    if env.ledger().timestamp() < op.expires_at {
+        // Not yet expired
+        return Err(XChainSyncError::Expired);
+    }
+
+    env.storage().persistent().remove(&key);
+
+    env.events().publish(
+        (symbol_short!("xcsync"), symbol_short!("cleaned")),
+        op_id.clone(),
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -722,10 +755,17 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Ledger, Env};
 
-    fn env_at(ts: u64) -> Env {
+    #[soroban_sdk::contract]
+    struct DummyXChainContract;
+
+    #[soroban_sdk::contractimpl]
+    impl DummyXChainContract {}
+
+    fn env_at(ts: u64) -> (Env, soroban_sdk::Address) {
         let env = Env::default();
         env.ledger().with_mut(|l| l.timestamp = ts);
-        env
+        let contract_id = env.register_contract(None, DummyXChainContract);
+        (env, contract_id)
     }
 
     fn dummy_root(env: &Env, seed: u8) -> BytesN<32> {
@@ -740,79 +780,151 @@ mod tests {
     }
 
     #[test]
-    fn test_begin_and_full_commit_flow() {
-        let env = env_at(1_000);
+    fn test_begin_atomic_xchain_op_enters_prepared() {
+        let (env, contract_id) = env_at(1_000);
         env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let expected_root = dummy_root(&env, 0x11);
+            let chains = dummy_chains(&env);
 
-        let initiator = soroban_sdk::Address::generate(&env);
-        let expected_root = dummy_root(&env, 0xAB);
-        let chains = dummy_chains(&env);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, chains.clone(), expected_root.clone())
+                .expect("begin should succeed");
 
-        let op_id = begin_atomic_xchain_op(&env, &initiator, chains, expected_root.clone())
-            .expect("begin should succeed");
+            let op = get_xchain_op(&env, &op_id).expect("op must exist");
+            assert_eq!(op.phase, XChainPhase::Prepared);
+            assert_eq!(op.prepared_count, 0);
+            assert_eq!(op.committed_count, 0);
+            assert_eq!(op.initiator, initiator);
+            assert_eq!(op.expected_state_root, expected_root);
+            assert_eq!(op.chain_ids, chains);
+            assert_eq!(op.created_at, 1_000);
+            assert_eq!(op.expires_at, 1_000 + XCHAIN_OP_TIMEOUT_SECS);
+        });
+    }
 
-        // Phase 1 acknowledge
-        let phase = acknowledge_prepare(&env, &op_id, 2).expect("ack prepare chain 2");
-        assert_eq!(phase, XChainPhase::Prepared);
-        let phase = acknowledge_prepare(&env, &op_id, 1).expect("ack prepare chain 1");
-        assert_eq!(phase, XChainPhase::Committing);
+    #[test]
+    fn test_begin_atomic_xchain_op_rejects_duplicate() {
+        let (env, contract_id) = env_at(1_000);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let expected_root = dummy_root(&env, 0x22);
+            let chains = dummy_chains(&env);
 
-        // Phase 2 commit
-        let phase = confirm_commit(&env, &op_id, 2, expected_root.clone()).expect("commit chain 2");
-        assert_eq!(phase, XChainPhase::Committing);
-        let phase = confirm_commit(&env, &op_id, 1, expected_root.clone()).expect("commit chain 1");
-        assert_eq!(phase, XChainPhase::Committed);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, chains.clone(), expected_root.clone())
+                .expect("first begin should succeed");
+
+            // Calling again with the same parameters in the same ledger yields identical op_id and must be rejected
+            let dup_res = begin_atomic_xchain_op(&env, &initiator, chains, expected_root);
+            assert_eq!(dup_res, Err(XChainSyncError::DuplicateOp));
+
+            let op = get_xchain_op(&env, &op_id).expect("original op must still exist");
+            assert_eq!(op.phase, XChainPhase::Prepared);
+        });
+    }
+
+    #[test]
+    fn test_expired_operation_cleaned_up() {
+        let (env, contract_id) = env_at(1_000);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let chains = dummy_chains(&env);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, chains, dummy_root(&env, 0x33))
+                .unwrap();
+
+            // Before expiry, cleanup returns Err(Expired)
+            assert_eq!(cleanup_expired_op(&env, &op_id), Err(XChainSyncError::Expired));
+
+            // Advance ledger time past XCHAIN_OP_TIMEOUT_SECS
+            env.ledger().with_mut(|li| li.timestamp += XCHAIN_OP_TIMEOUT_SECS + 1);
+
+            // Operation is cleaned up from storage
+            cleanup_expired_op(&env, &op_id).expect("should clean up expired op");
+            assert_eq!(get_xchain_op(&env, &op_id), None);
+        });
+    }
+
+    #[test]
+    fn test_begin_and_full_commit_flow() {
+        let (env, contract_id) = env_at(1_000);
+        env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let expected_root = dummy_root(&env, 0xAB);
+            let chains = dummy_chains(&env);
+
+            let op_id = begin_atomic_xchain_op(&env, &initiator, chains, expected_root.clone())
+                .expect("begin should succeed");
+
+            // Phase 1 acknowledge
+            let phase = acknowledge_prepare(&env, &op_id, 2).expect("ack prepare chain 2");
+            assert_eq!(phase, XChainPhase::Prepared);
+            let phase = acknowledge_prepare(&env, &op_id, 1).expect("ack prepare chain 1");
+            assert_eq!(phase, XChainPhase::Committing);
+
+            // Phase 2 commit
+            let phase = confirm_commit(&env, &op_id, 2, expected_root.clone()).expect("commit chain 2");
+            assert_eq!(phase, XChainPhase::Committing);
+            let phase = confirm_commit(&env, &op_id, 1, expected_root.clone()).expect("commit chain 1");
+            assert_eq!(phase, XChainPhase::Committed);
+        });
     }
 
     #[test]
     fn test_inconsistent_state_root_triggers_rollback() {
-        let env = env_at(1_000);
+        let (env, contract_id) = env_at(1_000);
         env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let expected_root = dummy_root(&env, 0xAA);
+            let bad_root = dummy_root(&env, 0xBB);
+            let chains = dummy_chains(&env);
 
-        let initiator = soroban_sdk::Address::generate(&env);
-        let expected_root = dummy_root(&env, 0xAA);
-        let bad_root = dummy_root(&env, 0xBB);
-        let chains = dummy_chains(&env);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, chains, expected_root.clone())
+                .expect("begin ok");
+            acknowledge_prepare(&env, &op_id, 2).unwrap();
+            acknowledge_prepare(&env, &op_id, 1).unwrap();
 
-        let op_id = begin_atomic_xchain_op(&env, &initiator, chains, expected_root.clone())
-            .expect("begin ok");
-        acknowledge_prepare(&env, &op_id, 2).unwrap();
-        acknowledge_prepare(&env, &op_id, 1).unwrap();
+            let result = confirm_commit(&env, &op_id, 2, bad_root.clone());
+            assert_eq!(result, Err(XChainSyncError::InvalidStateProof));
 
-        let result = confirm_commit(&env, &op_id, 2, bad_root.clone());
-        assert_eq!(result, Err(XChainSyncError::InvalidStateProof));
-
-        let op = get_xchain_op(&env, &op_id).unwrap();
-        assert_eq!(op.phase, XChainPhase::RollingBack);
+            let op = get_xchain_op(&env, &op_id).unwrap();
+            assert_eq!(op.phase, XChainPhase::RollingBack);
+        });
     }
 
     #[test]
     fn test_isolated_chain_blocks_new_ops() {
-        let env = env_at(1_000);
+        let (env, contract_id) = env_at(1_000);
+        env.as_contract(&contract_id, || {
+            isolate_chain(&env, 2, Symbol::new(&env, "sync_fail"), 5, 3_600);
+            assert!(is_chain_isolated(&env, 2));
 
-        isolate_chain(&env, 2, Symbol::new(&env, "sync_fail"), 5, 3_600);
-        assert!(is_chain_isolated(&env, 2));
-
-        let initiator = soroban_sdk::Address::generate(&env);
-        let mut chains = Vec::new(&env);
-        chains.push_back(2u32);
-        let result = begin_atomic_xchain_op(&env, &initiator, chains, dummy_root(&env, 1));
-        assert_eq!(result, Err(XChainSyncError::ChainIsolated));
+            let initiator = soroban_sdk::Address::generate(&env);
+            let mut chains = Vec::new(&env);
+            chains.push_back(2u32);
+            let result = begin_atomic_xchain_op(&env, &initiator, chains, dummy_root(&env, 1));
+            assert_eq!(result, Err(XChainSyncError::ChainIsolated));
+        });
     }
 
     #[test]
     fn test_lift_isolation_after_cooldown() {
-        let env = env_at(1_000);
-        isolate_chain(&env, 3, Symbol::new(&env, "reorg"), 3, 3_600);
-        assert!(is_chain_isolated(&env, 3));
+        let (env, contract_id) = env_at(1_000);
+        env.as_contract(&contract_id, || {
+            isolate_chain(&env, 3, Symbol::new(&env, "reorg"), 3, 3_600);
+            assert!(is_chain_isolated(&env, 3));
 
-        // Still within cooldown
-        assert!(!lift_chain_isolation(&env, 3));
+            // Still within cooldown
+            assert!(!lift_chain_isolation(&env, 3));
 
-        // Advance past cooling off period
-        env.ledger().with_mut(|l| l.timestamp = 1_000 + 3_601);
-        assert!(lift_chain_isolation(&env, 3));
-        assert!(!is_chain_isolated(&env, 3));
+            // Advance past cooling off period
+            env.ledger().with_mut(|l| l.timestamp = 1_000 + 3_601);
+            assert!(lift_chain_isolation(&env, 3));
+            assert!(!is_chain_isolated(&env, 3));
+        });
     }
 
     #[test]
@@ -824,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_state_merkle_root_single_leaf() {
-        let env = env_at(1_000);
+        let env = Env::default();
         let mut leaves = Vec::new(&env);
         leaves.push_back(BytesN::from_array(&env, &[1u8; 32]));
         let root = compute_state_merkle_root(&env, &leaves);
@@ -833,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_state_merkle_root_deterministic() {
-        let env = env_at(1_000);
+        let env = Env::default();
         let mut leaves = Vec::new(&env);
         leaves.push_back(BytesN::from_array(&env, &[0xAu8; 32]));
         leaves.push_back(BytesN::from_array(&env, &[0xBu8; 32]));
@@ -844,7 +956,7 @@ mod tests {
 
     #[test]
     fn test_validate_trivial_state_proof() {
-        let env = env_at(1_000);
+        let env = Env::default();
         let root = BytesN::from_array(&env, &[0xABu8; 32]);
         let proof = CrossChainStateProof {
             chain_id: 2,
@@ -858,18 +970,19 @@ mod tests {
 
     #[test]
     fn test_op_expiry() {
-        let env = env_at(1_000);
+        let (env, contract_id) = env_at(1_000);
         env.mock_all_auths();
+        env.as_contract(&contract_id, || {
+            let initiator = soroban_sdk::Address::generate(&env);
+            let chains = dummy_chains(&env);
+            let op_id = begin_atomic_xchain_op(&env, &initiator, chains, dummy_root(&env, 0))
+                .unwrap();
 
-        let initiator = soroban_sdk::Address::generate(&env);
-        let chains = dummy_chains(&env);
-        let op_id = begin_atomic_xchain_op(&env, &initiator, chains, dummy_root(&env, 0))
-            .unwrap();
-
-        // Advance past expiry.
-        env.ledger().with_mut(|l| l.timestamp = 1_000 + XCHAIN_OP_TIMEOUT_SECS + 1);
-        expire_xchain_op(&env, &op_id).expect("should expire");
-        let op = get_xchain_op(&env, &op_id).unwrap();
-        assert_eq!(op.phase, XChainPhase::Expired);
+            // Advance past expiry.
+            env.ledger().with_mut(|li| li.timestamp += XCHAIN_OP_TIMEOUT_SECS + 1);
+            expire_xchain_op(&env, &op_id).expect("should expire");
+            let op = get_xchain_op(&env, &op_id).unwrap();
+            assert_eq!(op.phase, XChainPhase::Expired);
+        });
     }
 }
