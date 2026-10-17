@@ -60,3 +60,93 @@ impl AdminRotationCoordinator {
         env.storage().instance().get(&DataKey::Contracts).unwrap_or(Vec::new(&env))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests (#1262)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_batch_propose_admin_change_integration() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Set up coordinator
+        let coordinator_admin = Address::generate(&env);
+        let coordinator = env.register_contract(None, AdminRotationCoordinator);
+
+        // Initialize coordinator
+        let mut client = AdminRotationCoordinatorClient::new(&env, &coordinator);
+        client.initialize(&coordinator_admin);
+
+        // Create 3 test contracts
+        let contract1 = env.register_contract_wasm(None, b"contract1");
+        let contract2 = env.register_contract_wasm(None, b"contract2");
+        let contract3 = env.register_contract_wasm(None, b"contract3");
+
+        // Register contracts
+        client.register_contract(&coordinator_admin, &contract1);
+        client.register_contract(&coordinator_admin, &contract2);
+        client.register_contract(&coordinator_admin, &contract3);
+
+        // Verify all contracts are registered
+        let registered = client.get_registered_contracts();
+        assert_eq!(registered.len(), 3);
+
+        // Perform batch admin change
+        let new_admin = Address::generate(&env);
+        client.batch_propose_admin_change(&coordinator_admin, &new_admin);
+    }
+
+    #[test]
+    fn test_register_contract_prevents_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let coordinator = env.register_contract(None, AdminRotationCoordinator);
+
+        let mut client = AdminRotationCoordinatorClient::new(&env, &coordinator);
+        client.initialize(&admin);
+
+        let contract = env.register_contract_wasm(None, b"test");
+
+        // Register same contract twice
+        client.register_contract(&admin, &contract);
+        client.register_contract(&admin, &contract);
+
+        // Should only be in the list once
+        let registered = client.get_registered_contracts();
+        assert_eq!(registered.len(), 1);
+    }
+
+    #[test]
+    fn test_get_registered_contracts_returns_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let coordinator = env.register_contract(None, AdminRotationCoordinator);
+
+        let mut client = AdminRotationCoordinatorClient::new(&env, &coordinator);
+        client.initialize(&admin);
+
+        // Register 3 contracts
+        let contract1 = env.register_contract_wasm(None, b"c1");
+        let contract2 = env.register_contract_wasm(None, b"c2");
+        let contract3 = env.register_contract_wasm(None, b"c3");
+
+        client.register_contract(&admin, &contract1);
+        client.register_contract(&admin, &contract2);
+        client.register_contract(&admin, &contract3);
+
+        let registered = client.get_registered_contracts();
+        assert_eq!(registered.len(), 3);
+    }
+}
