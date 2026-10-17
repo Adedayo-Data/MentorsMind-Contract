@@ -8,6 +8,7 @@ use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
     key_min_bond, key_cooldown_days,
     DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS,
+    validate_amount_limits, MAX_FINANCIAL_AMOUNT,
 };
 
 // ---------------------------------------------------------------------------
@@ -233,7 +234,7 @@ impl PerformanceBondContract {
             .get(&DataKey::Bond(mentor.clone()))
             .ok_or(Error::NoBondFound)?;
 
-        if amount <= 0 {
+        if !validate_amount_limits(amount, 1, MAX_FINANCIAL_AMOUNT) {
             return Err(Error::InvalidAmount);
         }
 
