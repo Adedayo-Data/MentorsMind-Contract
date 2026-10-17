@@ -10,6 +10,7 @@ use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAc
 use shared::GasEstimate;
 use shared::dynamic_fees::{calculate_dynamic_fee, DynamicFeeResult};
 use shared::health_reporter::{report_metric, MetricCategory};
+use shared::atomic_state::{StateTransitionContext, STATE_TRANSITION_TIMEOUT_SECS};
 use shared::CrossContractAuth;
 use shared::platform_authenticity::{detect_fee_evasion, PenaltyTier};
 
@@ -94,6 +95,7 @@ pub enum DataKey {
     NamespaceRoot,
     HighValueThreshold,
     PendingHighValueSession(Symbol),
+    ActiveDeployContext,
 }
 
 #[contracttype]
@@ -397,15 +399,18 @@ impl EscrowFactory {
         let nonce_key = (SESSION_NONCE, session_id.clone());
         let nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
         let next_nonce = nonce.checked_add(1).expect("nonce overflow");
+        let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
+
+        Self::start_deploy_context(&env, salt.clone(), next_nonce as u64, now);
+
         env.storage().persistent().set(&nonce_key, &next_nonce);
         env.storage()
             .persistent()
             .extend_ttl(&nonce_key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
 
-        let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
-
         // Deploy new escrow instance as minimal proxy
         let escrow_address = Self::deploy_minimal_proxy(&env, &implementation, salt);
+        Self::mark_deploy_checkpoint(&env);
 
         // Calculate dynamic fee
         let system_load: u32 = 0; // Replace with actual load metric
@@ -414,7 +419,7 @@ impl EscrowFactory {
 
         // Initialize the new escrow contract
         let initialize_sym = Symbol::new(&env, "initialize");
-        let _: () = env.invoke_contract(
+        let initialize_result = env.try_invoke_contract::<(), soroban_sdk::Error>(
             &escrow_address,
             &initialize_sym,
             (
@@ -426,10 +431,15 @@ impl EscrowFactory {
             )
                 .into_val(&env),
         );
+        if !matches!(initialize_result, Ok(Ok(()))) {
+            Self::initiate_deploy_rollback(&env);
+            panic!("escrow initialization failed");
+        }
+        Self::mark_deploy_checkpoint(&env);
 
         // Create escrow in the deployed contract
         let create_escrow_sym = Symbol::new(&env, "create_escrow");
-        let _: Address = env.invoke_contract(
+        let create_result = env.try_invoke_contract::<Address, soroban_sdk::Error>(
             &escrow_address,
             &create_escrow_sym,
             (
@@ -442,6 +452,11 @@ impl EscrowFactory {
             )
                 .into_val(&env),
         );
+            if !matches!(create_result, Ok(Ok(_))) {
+                Self::initiate_deploy_rollback(&env);
+                panic!("escrow creation failed");
+            }
+            Self::mark_deploy_checkpoint(&env);
 
         // Store mapping
         env.storage()
@@ -485,12 +500,18 @@ impl EscrowFactory {
         // Register interface in the interface registry (if set)
         if let Some(registry_addr) = env.storage().persistent().get::<_, Address>(&INTERFACE_REGISTRY) {
             let interface_id = Symbol::new(&env, "escrow_v1");
-            let _: () = env.invoke_contract(
+            let register_result = env.try_invoke_contract::<(), soroban_sdk::Error>(
                 &registry_addr,
                 &Symbol::new(&env, "register_interface"),
                 (escrow_address.clone(), interface_id, 1u32).into_val(&env),
             );
+            if !matches!(register_result, Ok(Ok(()))) {
+                Self::initiate_deploy_rollback(&env);
+                panic!("interface registration failed");
+            }
         }
+        Self::mark_deploy_checkpoint(&env);
+        Self::complete_deploy_context(&env);
 
         // Report health metric for escrow creation
         if let Some(dashboard) = env.storage().persistent().get::<_, Address>(&HEALTH_DASHBOARD) {
@@ -903,6 +924,71 @@ impl EscrowFactory {
             let _ = env.register_contract(Some(&addr), MockEscrow);
         }
         addr
+    }
+
+    fn start_deploy_context(env: &Env, transition_id: BytesN<32>, entity_id: u64, now: u64) {
+        let timeout_at = now
+            .checked_add(STATE_TRANSITION_TIMEOUT_SECS)
+            .expect("deployment timeout overflow");
+        let context = StateTransitionContext {
+            transition_id,
+            entity_id,
+            pre_state: Symbol::new(env, "uninitialized"),
+            post_state: Symbol::new(env, "deployed"),
+            started_at: now,
+            timeout_at,
+            checkpoints_passed: 0,
+            total_checkpoints: 4,
+            lock_holder: env.current_contract_address(),
+            rollback_initiated: false,
+        };
+        let key = DataKey::ActiveDeployContext;
+        env.storage().persistent().set(&key, &context);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    fn mark_deploy_checkpoint(env: &Env) {
+        let key = DataKey::ActiveDeployContext;
+        let mut context: StateTransitionContext = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("deployment context missing");
+        context.checkpoints_passed = context
+            .checkpoints_passed
+            .checked_add(1)
+            .expect("deployment checkpoint overflow");
+        env.storage().persistent().set(&key, &context);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    fn initiate_deploy_rollback(env: &Env) {
+        let key = DataKey::ActiveDeployContext;
+        if let Some(mut context) = env
+            .storage()
+            .persistent()
+            .get::<_, StateTransitionContext>(&key)
+        {
+            context.rollback_initiated = true;
+            env.storage().persistent().set(&key, &context);
+        }
+    }
+
+    fn complete_deploy_context(env: &Env) {
+        let key = DataKey::ActiveDeployContext;
+        let context: StateTransitionContext = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("deployment context missing");
+        if context.checkpoints_passed < context.total_checkpoints {
+            panic!("deployment checkpoints incomplete");
+        }
+        env.storage().persistent().remove(&key);
     }
 
     /// Get admin address (internal helper)

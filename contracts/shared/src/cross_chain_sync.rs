@@ -1,9 +1,165 @@
-//! Cross-Chain State Synchronization (#866)
+//! Cross-Chain State Synchronization
 //!
-//! Implements atomic cross-chain transaction protocols with two-phase commit
-//! and rollback, state merkle-tree synchronization with cryptographic
-//! consistency proofs, finality-aware operations, chain-reorganization
-//! protection, and emergency isolation procedures.
+//! This module implements an atomic two-phase commit (2PC) protocol for
+//! coordinating state changes across heterogeneous blockchains. It is
+//! designed for use by bridge relayers and cross-chain dApp backends that
+//! need strong consistency guarantees when mutating state on more than one
+//! ledger simultaneously.
+//!
+//! # Protocol Overview
+//!
+//! The protocol treats one Soroban contract as the **coordinator** and every
+//! participating chain as a **participant**. The coordinator drives the
+//! operation through its phases; participants reply via relayer-delivered
+//! acknowledgements. All state is stored in the coordinator contract's
+//! persistent storage so it survives ledger restarts and can be queried
+//! off-chain.
+//!
+//! ## Two-Phase Commit Sequence
+//!
+//! ```text
+//! Coordinator                         Participants (chains A, B, …)
+//! ──────────────────────────────────────────────────────────────────
+//! begin_atomic_xchain_op()
+//!   → phase: Prepared
+//!   → emits "xcsync/prepared" event
+//!                                     ← relayer delivers prepare msg
+//!                                     ← each chain executes & locks state
+//! acknowledge_prepare(chain_A)
+//! acknowledge_prepare(chain_B)
+//!   → when all chains ACK:
+//!     phase: Committing
+//!     emits "xcsync/commit" event
+//!                                     ← relayer delivers commit msg
+//!                                     ← each chain finalises state
+//! confirm_commit(chain_A, root_A)
+//! confirm_commit(chain_B, root_B)
+//!   → state roots validated against expected_state_root
+//!   → when all chains confirm:
+//!     phase: Committed
+//!     emits "xcsync/committed" event
+//! ```
+//!
+//! An operation only reaches `Committed` when **every** participating chain
+//! has reported the correct Merkle root. If any root mismatches the
+//! `expected_state_root` supplied at creation time, `confirm_commit`
+//! automatically records the inconsistency and calls `initiate_rollback`.
+//!
+//! ## Rollback Flow
+//!
+//! Rollback can be triggered by:
+//!
+//! * A mismatched state root during `confirm_commit`.
+//! * An explicit call to `initiate_rollback` (e.g. by governance or the
+//!   initiator on timeout).
+//! * A reorg event that invalidates a previously submitted operation.
+//!
+//! ```text
+//! initiate_rollback(op_id)
+//!   → phase: RollingBack
+//!   → emits "xcsync/rollback" event
+//!                                     ← relayer broadcasts undo messages
+//!                                     ← each chain reverts locked state
+//! confirm_rollback(op_id)
+//!   → phase: RolledBack
+//!   → emits "xcsync/rolled_bk" event
+//! ```
+//!
+//! ## Operation Lifecycle
+//!
+//! ```text
+//!            ┌──────────────────────────────────────┐
+//!            │           timeout / reorg             │
+//!            ▼                                       │
+//! [Prepared] → (all ACK) → [Committing] → (all OK) → [Committed]
+//!    │                          │
+//!    └── rollback ──────────────┘
+//!            │
+//!            ▼
+//!      [RollingBack] → (relayers confirm) → [RolledBack]
+//!
+//! [Prepared] or [Committing] → (past expires_at) → [Expired]
+//! ```
+//!
+//! Terminal states (`Committed`, `RolledBack`, `Expired`) are immutable.
+//!
+//! ## Finality Tiers
+//!
+//! Different chains offer different finality guarantees. This module models
+//! four tiers so callers can apply the right confirmation policy:
+//!
+//! | Tier | Examples | Policy |
+//! |------|----------|--------|
+//! | `Deterministic` | Stellar, Cosmos | Block depth ≥ `required_confirmations` |
+//! | `Instant` | L2 with operator attestation | Block depth ≥ `required_confirmations` |
+//! | `Probabilistic` | Ethereum, Bitcoin | Block depth ≥ max(`required_confirmations`, `REORG_SAFE_DEPTH`) |
+//! | `Optimistic` | Optimism, Arbitrum | Challenge period must have elapsed |
+//!
+//! Call [`require_finality`] before advancing an operation to `Committing`
+//! on probabilistic or optimistic chains to avoid commit-on-reorg bugs.
+//!
+//! ## Security Assumptions
+//!
+//! * **Relayer honesty**: The module does not verify relayer signatures.
+//!   Callers are responsible for gating `acknowledge_prepare` and
+//!   `confirm_commit` behind appropriate authority checks (e.g. a whitelist
+//!   of trusted relayer addresses) before invoking these functions.
+//! * **State root integrity**: `expected_state_root` must be computed by a
+//!   trusted, deterministic process before the operation is created. A
+//!   compromised root generator can cause spurious rollbacks or accepted
+//!   invalid state.
+//! * **Clock trust**: `XCHAIN_OP_TIMEOUT_SECS` and isolation cooling-off
+//!   periods rely on `env.ledger().timestamp()`, which is set by validators.
+//!   In adversarial conditions a validator majority could manipulate timing.
+//! * **Isolated chains**: Once a chain is isolated, no new operations
+//!   involving it are accepted until governance calls [`lift_chain_isolation`]
+//!   after the cooling-off period. Do not bypass isolation in relayer code.
+//! * **Reorg depth**: `REORG_SAFE_DEPTH` is a conservative default. Chains
+//!   with historically deep reorgs may require a larger value.
+//!
+//! # Example
+//!
+//! The following shows how a bridge contract initiates an atomic operation,
+//! processes acknowledgements from two chains, and commits:
+//!
+//! ```rust,ignore
+//! use shared::cross_chain_sync::{
+//!     begin_atomic_xchain_op, acknowledge_prepare, confirm_commit, XChainPhase,
+//! };
+//! use soroban_sdk::{BytesN, Env, Vec};
+//!
+//! fn bridge_transfer(
+//!     env: &Env,
+//!     initiator: &soroban_sdk::Address,
+//!     expected_root: BytesN<32>,
+//! ) {
+//!     // 1. Open the atomic operation across Ethereum (chain 2) and Solana (chain 1).
+//!     let mut chains: Vec<u32> = Vec::new(env);
+//!     chains.push_back(2u32); // Ethereum
+//!     chains.push_back(1u32); // Solana
+//!
+//!     let op_id = begin_atomic_xchain_op(env, initiator, chains, expected_root.clone())
+//!         .expect("failed to begin atomic op");
+//!     // op_id is stored persistently; hand it to your relayer layer.
+//!
+//!     // 2. Relayer calls back once Ethereum acknowledges Phase 1.
+//!     let phase = acknowledge_prepare(env, &op_id, 2 /* Ethereum */)
+//!         .expect("ack failed");
+//!     assert_eq!(phase, XChainPhase::Prepared); // one chain still pending
+//!
+//!     // 3. Relayer calls back once Solana acknowledges Phase 1.
+//!     let phase = acknowledge_prepare(env, &op_id, 1 /* Solana */)
+//!         .expect("ack failed");
+//!     assert_eq!(phase, XChainPhase::Committing); // all chains ACK'd → commit begins
+//!
+//!     // 4. Relayer submits Phase 2 confirmations with the observed state roots.
+//!     //    confirm_commit automatically rolls back if roots don't match expected_root.
+//!     confirm_commit(env, &op_id, 2, expected_root.clone()).expect("commit chain 2 failed");
+//!     let final_phase = confirm_commit(env, &op_id, 1, expected_root.clone())
+//!         .expect("commit chain 1 failed");
+//!     assert_eq!(final_phase, XChainPhase::Committed);
+//! }
+//! ```
 
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbol, Vec};
 
@@ -11,14 +167,37 @@ use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbo
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum cross-chain operation age before automatic expiry (24 hours).
+/// Maximum lifetime of a cross-chain operation before it is eligible for
+/// expiry, in seconds (24 hours).
+///
+/// If a cross-chain operation remains in `Prepared` or `Committing` for
+/// longer than this value without receiving all acknowledgements or commit
+/// confirmations, any party may call [`expire_xchain_op`] to move it to the
+/// terminal `Expired` state. Bridge operators should configure their relayer
+/// watchdog to call that function before this deadline to release any locked
+/// resources on participating chains.
 pub const XCHAIN_OP_TIMEOUT_SECS: u64 = 86_400;
 
-/// Minimum finality confirmations required before committing (configurable).
+/// Default minimum number of block confirmations (or ledger closes) required
+/// before an operation is considered final on a given chain.
+///
+/// This value is a **conservative floor** suitable for most EVM-compatible
+/// chains operating under proof-of-stake consensus. Individual
+/// [`ChainFinalityConfig`] instances may raise this per-chain. For
+/// probabilistic chains (`FinalityTier::Probabilistic`) the effective
+/// requirement is `max(MIN_FINALITY_CONFIRMATIONS, REORG_SAFE_DEPTH)`.
 pub const MIN_FINALITY_CONFIRMATIONS: u32 = 12;
 
-/// Reorg protection depth — operations submitted before this block depth
-/// are considered safe against chain reorganization.
+/// Minimum block depth below which an operation is considered vulnerable to
+/// chain reorganisation.
+///
+/// Operations on `FinalityTier::Probabilistic` chains (e.g. Ethereum,
+/// Bitcoin) are rejected by [`require_finality`] until the submitting block
+/// is at least `REORG_SAFE_DEPTH` blocks behind the current chain tip.
+/// 64 blocks is roughly 12–13 minutes on Ethereum (12 s/block) and provides
+/// protection against all historically observed reorgs with a significant
+/// safety margin. Increase this constant for chains with slower finality
+/// or a documented history of deep reorgs.
 pub const REORG_SAFE_DEPTH: u64 = 64;
 
 /// Maximum number of participating chains in a single atomic operation.
