@@ -308,6 +308,10 @@ pub enum DataKey {
     /// Staking contract queried for the proposer's `staked_at` timestamp
     /// when enforcing the minimum holding period on `create_proposal`.
     StakingContract,
+    /// Sequential index of proposal IDs grouped by status for paginated filtering.
+    ProposalsByStatus(ProposalStatus, u32),
+    /// Per-status proposal count used as the next write index.
+    ProposalStatusCount(ProposalStatus),
 }
 
 #[contracttype]
@@ -350,6 +354,20 @@ impl GovernanceContract {
         if !ProposalStatus::is_valid_transition(env, &from, &to) {
             panic!("invalid transition from {:?} to {:?}", from, to);
         }
+
+        // Maintain ProposalsByStatus index: append proposal.id under new status
+        let new_count = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ProposalStatusCount(to.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalsByStatus(to.clone(), new_count), &proposal.id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalStatusCount(to.clone()), &(new_count + 1));
+
         proposal.status = to;
     }
 
@@ -2374,6 +2392,47 @@ impl GovernanceContract {
             (symbol_short!("govtx"), symbol_short!("flag_clr")),
             voter,
         );
+    }
+
+    /// Returns a paginated list of proposal IDs filtered by status.
+    ///
+    /// Used by governance UIs to show Active, Passed, Executed, or Failed proposals.
+    ///
+    /// # Arguments
+    /// * `status` - Proposal status to filter by (Active, Passed, Executed, etc.)
+    /// * `offset` - Starting index in the status-filtered list
+    /// * `limit` - Maximum results (clamped to MAX_PAGE_SIZE)
+    ///
+    /// # Returns
+    /// Vector of proposal IDs in the specified status, paginated.
+    pub fn get_proposals_by_status(
+        env: Env,
+        status: ProposalStatus,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u32> {
+        use shared::pagination::Pagination;
+
+        let total = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ProposalStatusCount(status.clone()))
+            .unwrap_or(0);
+
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut result = vec![&env];
+
+        for idx in start..end {
+            if let Some(proposal_id) = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::ProposalsByStatus(status.clone(), idx))
+            {
+                result.push_back(proposal_id);
+            }
+        }
+
+        result
     }
 }
 

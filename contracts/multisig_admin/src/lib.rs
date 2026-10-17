@@ -14,6 +14,8 @@ use shared::{
     KeyRecord, KeyRotationProposal, KeyScheme,
     // #867 — Transaction intent / high-risk operation protection
     evaluate_transaction_intent, get_protection_state, TransactionIntent,
+    // #1271 — Admin rotation
+    AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS,
 };
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
@@ -120,6 +122,11 @@ pub enum DataKey {
     // -----------------------------------------------------------------------
     /// Key management namespace root for this multisig instance.
     KeyManagementRoot,
+    // -----------------------------------------------------------------------
+    // #1271 — Admin rotation keys
+    // -----------------------------------------------------------------------
+    /// Pending admin transfer with cooling-off period enforcement.
+    PendingAdminTransfer,
 }
 
 /// Record of a multisig-signer-reviewed dispute oversight audit.
@@ -1279,6 +1286,97 @@ fn apply_update_threshold(env: &Env, new_threshold: u32) -> Result<(), Error> {
         (symbol_short!("multisig"), symbol_short!("thresh"), new_threshold),
         old_threshold,
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #1271 — Admin rotation (two-step with timelock)
+// ---------------------------------------------------------------------------
+
+/// Propose an admin key rotation with MIN_ADMIN_TIMELOCK_SECS cooling period.
+pub fn propose_admin_change(env: &Env, current_admin: Address, new_admin: Address) -> Result<AdminTransfer, Error> {
+    current_admin.require_auth();
+
+    if env.storage().persistent().has(&DataKey::PendingAdminTransfer) {
+        return Err(Error::AlreadyInitialized); // Transfer already pending
+    }
+
+    let proposed_at = env.ledger().timestamp();
+    let accepted_at = proposed_at + MIN_ADMIN_TIMELOCK_SECS;
+
+    let transfer = AdminTransfer {
+        old_admin: current_admin.clone(),
+        new_admin: new_admin.clone(),
+        proposed_at,
+        accepted_at,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::PendingAdminTransfer, &transfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("admin_propose")),
+        (current_admin, new_admin),
+    );
+
+    Ok(transfer)
+}
+
+/// Accept a pending admin transfer after the timelock has expired.
+pub fn accept_admin_change(env: &Env, new_admin: Address) -> Result<(), Error> {
+    new_admin.require_auth();
+
+    let transfer: AdminTransfer = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PendingAdminTransfer)
+        .ok_or(Error::ProposalNotFound)?;
+
+    let now = env.ledger().timestamp();
+    if now < transfer.accepted_at {
+        return Err(Error::Expired); // Timelock not yet expired
+    }
+
+    if transfer.new_admin != new_admin {
+        return Err(Error::NotAdmin); // Only the new admin can accept
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingAdminTransfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("admin_accept")),
+        (transfer.old_admin, new_admin),
+    );
+
+    Ok(())
+}
+
+/// Cancel a pending admin transfer (current admin only).
+pub fn cancel_admin_change(env: &Env, current_admin: Address) -> Result<(), Error> {
+    current_admin.require_auth();
+
+    let transfer: AdminTransfer = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PendingAdminTransfer)
+        .ok_or(Error::ProposalNotFound)?;
+
+    if transfer.old_admin != current_admin {
+        return Err(Error::NotAdmin);
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingAdminTransfer);
+
+    env.events().publish(
+        (symbol_short!("multisig"), symbol_short!("admin_cancel")),
+        (transfer.old_admin, transfer.new_admin),
+    );
+
     Ok(())
 }
 

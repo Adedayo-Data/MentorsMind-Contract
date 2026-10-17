@@ -81,6 +81,10 @@ pub enum DataKey {
     Bond(Address),
     SlashHistory(Address),
     PerfectSessionsCount(Address),
+    /// Sequential index of slash events for a mentor (for pagination).
+    SlashIndex(Address, u32),
+    /// Count of slash events for a mentor.
+    SlashCount(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +279,25 @@ impl PerformanceBondContract {
         env.storage()
             .persistent()
             .set(&DataKey::SlashHistory(mentor.clone()), &history);
+
+        // Maintain SlashIndex for pagination (#1272)
+        let slash_count = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::SlashCount(mentor.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashIndex(mentor.clone(), slash_count), &SlashEvent {
+                amount,
+                reason: reason.clone(),
+                timestamp: env.ledger().timestamp(),
+                slash_count_at_time: record.slash_count,
+            });
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashCount(mentor.clone()), &(slash_count + 1));
+
         env.storage()
             .persistent()
             .set(&DataKey::PerfectSessionsCount(mentor.clone()), &0u32);
@@ -308,6 +331,48 @@ impl PerformanceBondContract {
             .persistent()
             .get(&DataKey::SlashHistory(mentor))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the total count of slash events for a mentor (#1272).
+    pub fn get_slash_count(env: Env, mentor: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SlashCount(mentor))
+            .unwrap_or(0)
+    }
+
+    /// Returns a paginated slice of a mentor's slash history (#1272).
+    ///
+    /// # Arguments
+    /// * `mentor` - The mentor address to fetch slash history for
+    /// * `offset` - Starting index in the slash history
+    /// * `limit` - Maximum results to return (clamped to MAX_PAGE_SIZE)
+    ///
+    /// # Returns
+    /// Vector of SlashEvent records for the given page.
+    pub fn get_slash_history_page(
+        env: Env,
+        mentor: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<SlashEvent> {
+        use shared::pagination::Pagination;
+
+        let total = Self::get_slash_count(&env, mentor.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+        let mut result = Vec::new(&env);
+
+        for idx in start..end {
+            if let Some(event) = env
+                .storage()
+                .persistent()
+                .get::<_, SlashEvent>(&DataKey::SlashIndex(mentor.clone(), idx))
+            {
+                result.push_back(event);
+            }
+        }
+
+        result
     }
 
     /// Record a perfect 5-star session for mentor recovery.
