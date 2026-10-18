@@ -13,7 +13,7 @@
 //! correct across deposits/withdrawals that change the total pool size at
 //! different times.
 
-use shared::StakeRecord;
+use shared::{safe_math::SafeMath, StakeRecord};
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol};
 
 #[contracterror]
@@ -372,13 +372,11 @@ impl DelegatedStakingProxy {
             .get(&DataKey::RewardPerShare)
             .unwrap_or(0);
         let increment = amount
-            .checked_mul(PRECISION)
-            .expect("Overflow")
-            .checked_div(total_deposited)
-            .expect("Overflow");
+            .safe_mul(&env, PRECISION)
+            .safe_div(&env, total_deposited);
         env.storage().instance().set(
             &DataKey::RewardPerShare,
-            &(reward_per_share.checked_add(increment).expect("Overflow")),
+            &reward_per_share.safe_add(&env, increment),
         );
 
         Ok(())
@@ -472,10 +470,8 @@ impl DelegatedStakingProxy {
             .get(&DataKey::OwnerPendingRewards(owner))
             .unwrap_or(0);
         let accumulated = deposit
-            .checked_mul(reward_per_share)
-            .expect("Overflow")
-            .checked_div(PRECISION)
-            .expect("Overflow");
+            .safe_mul(&env, reward_per_share)
+            .safe_div(&env, PRECISION);
         already_pending + (accumulated - debt)
     }
 
@@ -537,10 +533,8 @@ impl DelegatedStakingProxy {
             .get(&DataKey::OwnerRewardDebt(owner.clone()))
             .unwrap_or(0);
         let accumulated = deposit
-            .checked_mul(reward_per_share)
-            .expect("Overflow")
-            .checked_div(PRECISION)
-            .expect("Overflow");
+            .safe_mul(env, reward_per_share)
+            .safe_div(env, PRECISION);
         let delta = accumulated - debt;
         if delta > 0 {
             let pending: i128 = env
@@ -571,10 +565,8 @@ impl DelegatedStakingProxy {
             .get(&DataKey::RewardPerShare)
             .unwrap_or(0);
         let debt = deposit
-            .checked_mul(reward_per_share)
-            .expect("Overflow")
-            .checked_div(PRECISION)
-            .expect("Overflow");
+            .safe_mul(env, reward_per_share)
+            .safe_div(env, PRECISION);
         env.storage()
             .persistent()
             .set(&DataKey::OwnerRewardDebt(owner.clone()), &debt);
