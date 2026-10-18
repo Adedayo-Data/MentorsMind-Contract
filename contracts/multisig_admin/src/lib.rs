@@ -17,6 +17,7 @@ use shared::{
     // #1271 — Admin rotation
     AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS,
 };
+use shared::ttl_utils::{PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD};
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
     Env, Symbol, TryIntoVal, Val, Vec,
@@ -233,10 +234,25 @@ impl MultisigAdminContract {
             cancelled: false,
         };
         env.storage().persistent().set(&DataKey::Proposal(new_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(new_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.storage()
             .persistent()
             .set(&DataKey::ProposalArgsChecksum(new_id), &args_checksum);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ProposalArgsChecksum(new_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.storage().persistent().set(&DataKey::Approval(new_id, proposer.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approval(new_id, proposer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("proposed"), new_id),
             (proposer, expiry),
@@ -269,8 +285,18 @@ impl MultisigAdminContract {
         }
         signer.require_auth();
         env.storage().persistent().set(&DataKey::Approval(action_id, signer.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Approval(action_id, signer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         proposal.approval_count = proposal.approval_count.checked_add(1).expect("approval count overflow");
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(action_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("multisig"), symbol_short!("signed"), action_id),
             (signer, proposal.approval_count),
@@ -311,6 +337,11 @@ impl MultisigAdminContract {
         // Mark executed before dispatch (prevents re-entrancy)
         proposal.executed = true;
         env.storage().persistent().set(&DataKey::Proposal(action_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(action_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         let event_target   = proposal.target.clone();
         let event_function = proposal.function.clone();
@@ -1549,6 +1580,19 @@ mod test {
         });
 
         assert_eq!(f.client().try_execute_action(&pid), Err(Ok(Error::ProposalArgsTampered)));
+    }
+
+    #[test]
+    fn test_proposal_survives_default_ttl() {
+        let f = Fixture::setup();
+        let target = Address::generate(&f.env);
+        let pid = f.propose(&target, "do_thing");
+
+        f.env.ledger().with_mut(|li| li.sequence_number += 300_000);
+
+        assert_eq!(f.client().get_proposal(&pid).approval_count, 1u32);
+        f.client().sign_action(&f.signers[1], &pid);
+        assert_eq!(f.client().get_proposal(&pid).approval_count, 2u32);
     }
 
     #[test]
