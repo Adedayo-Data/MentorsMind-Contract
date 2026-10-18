@@ -13,8 +13,10 @@
 //! correct across deposits/withdrawals that change the total pool size at
 //! different times.
 
-use shared::StakeRecord;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol};
+use shared::{pagination::Pagination, safe_math::SafeMath, StakeRecord};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -57,6 +59,10 @@ pub enum DataKey {
     MinDeposit,
     /// Each owner's currently deposited (staked) amount.
     BeneficialOwner(Address),
+    /// Sequential enumeration index of beneficial owners, assigned on first deposit.
+    OwnerIndex(u32),
+    /// Number of beneficial owners ever indexed (one per `OwnerIndex` slot).
+    OwnerCount,
     TotalDeposited,
     /// Single consolidated stake held by the proxy on behalf of all owners.
     ProxyStakeRecord,
@@ -148,11 +154,18 @@ impl DelegatedStakingProxy {
             .persistent()
             .get(&DataKey::BeneficialOwner(owner.clone()))
             .unwrap_or(0);
+        let is_new_owner = !env
+            .storage()
+            .persistent()
+            .has(&DataKey::BeneficialOwner(owner.clone()));
         let new_owner_deposit = prior_owner_deposit.checked_add(amount).expect("Overflow");
         env.storage().persistent().set(
             &DataKey::BeneficialOwner(owner.clone()),
             &new_owner_deposit,
         );
+        if is_new_owner {
+            Self::index_owner(&env, &owner);
+        }
 
         Self::reset_debt(&env, &owner);
 
@@ -372,13 +385,11 @@ impl DelegatedStakingProxy {
             .get(&DataKey::RewardPerShare)
             .unwrap_or(0);
         let increment = amount
-            .checked_mul(PRECISION)
-            .expect("Overflow")
-            .checked_div(total_deposited)
-            .expect("Overflow");
+            .safe_mul(&env, PRECISION)
+            .safe_div(&env, total_deposited);
         env.storage().instance().set(
             &DataKey::RewardPerShare,
-            &(reward_per_share.checked_add(increment).expect("Overflow")),
+            &reward_per_share.safe_add(&env, increment),
         );
 
         Ok(())
@@ -431,6 +442,33 @@ impl DelegatedStakingProxy {
             .unwrap_or(0)
     }
 
+    pub fn get_owner_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OwnerCount)
+            .unwrap_or(0)
+    }
+
+    /// Returns up to `limit` beneficial owners starting at `offset`, paired
+    /// with their current deposited balance. `limit` is clamped to
+    /// `MAX_PAGE_SIZE` and an out-of-range `offset` yields an empty page.
+    pub fn get_owners_page(env: Env, offset: u32, limit: u32) -> Vec<(Address, i128)> {
+        let total = Self::get_owner_count(env.clone());
+        let (start, end) = Pagination::bounds(total, offset, limit);
+
+        let mut page = Vec::new(&env);
+        for index in start..end {
+            let owner: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OwnerIndex(index))
+                .expect("Owner index missing");
+            let balance = Self::get_beneficial_owner(env.clone(), owner.clone());
+            page.push_back((owner, balance));
+        }
+        page
+    }
+
     pub fn get_total_deposited(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -472,10 +510,8 @@ impl DelegatedStakingProxy {
             .get(&DataKey::OwnerPendingRewards(owner))
             .unwrap_or(0);
         let accumulated = deposit
-            .checked_mul(reward_per_share)
-            .expect("Overflow")
-            .checked_div(PRECISION)
-            .expect("Overflow");
+            .safe_mul(&env, reward_per_share)
+            .safe_div(&env, PRECISION);
         already_pending + (accumulated - debt)
     }
 
@@ -501,6 +537,20 @@ impl DelegatedStakingProxy {
             return Err(Error::Unauthorized);
         }
         Ok(())
+    }
+
+    fn index_owner(env: &Env, owner: &Address) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OwnerCount)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIndex(count), owner);
+        env.storage()
+            .instance()
+            .set(&DataKey::OwnerCount, &count.safe_add(env, 1));
     }
 
     fn compute_tier(amount: i128) -> u32 {
@@ -537,10 +587,8 @@ impl DelegatedStakingProxy {
             .get(&DataKey::OwnerRewardDebt(owner.clone()))
             .unwrap_or(0);
         let accumulated = deposit
-            .checked_mul(reward_per_share)
-            .expect("Overflow")
-            .checked_div(PRECISION)
-            .expect("Overflow");
+            .safe_mul(env, reward_per_share)
+            .safe_div(env, PRECISION);
         let delta = accumulated - debt;
         if delta > 0 {
             let pending: i128 = env
@@ -571,10 +619,8 @@ impl DelegatedStakingProxy {
             .get(&DataKey::RewardPerShare)
             .unwrap_or(0);
         let debt = deposit
-            .checked_mul(reward_per_share)
-            .expect("Overflow")
-            .checked_div(PRECISION)
-            .expect("Overflow");
+            .safe_mul(env, reward_per_share)
+            .safe_div(env, PRECISION);
         env.storage()
             .persistent()
             .set(&DataKey::OwnerRewardDebt(owner.clone()), &debt);
