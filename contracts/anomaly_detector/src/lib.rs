@@ -4,7 +4,7 @@ use shared::events::{
     emit_anomaly_event, evt_anomaly_detected, evt_anomaly_hold_cleared, evt_anomaly_hold_placed,
 };
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol,
+    contract, contractclient, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,8 @@ pub enum DataKey {
     Config,
     Metrics(Address),
     Hold(Address),
+    UserIndex(u32),      // Sequential index of monitored users (#1264)
+    UserCount,            // Total count of monitored users (#1264)
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +100,29 @@ const ONE_DAY_SECS:   u64 = 86_400;
 const DEFAULT_ESCROW_WARN_PER_HOUR:  u32  = 10;
 const DEFAULT_DISPUTE_HOLD_PER_DAY:  u32  = 3;
 const DEFAULT_VOLUME_HOLD_PER_HOUR:  i128 = 50_000 * 1_000_000;
+
+// TTL and pagination constants (#1265, #1264)
+const PERSISTENT_LIFETIME_THRESHOLD: u32 = 34560;  // ~14 days in ledgers
+const PERSISTENT_BUMP_AMOUNT: u32 = 7200;          // ~3 days in ledgers
+const HOLD_TTL: u32 = 864000;                       // Maximum TTL for hold flags
+const MAX_PAGE_SIZE: u32 = 100;                     // Maximum items per pagination page
+
+// ---------------------------------------------------------------------------
+// Contract Client (#1263)
+// ---------------------------------------------------------------------------
+
+#[contractclient(name = "AnomalyDetectorClient")]
+pub trait AnomalyDetectorTrait {
+    fn initialize(env: Env, admin: Address) -> Result<(), Error>;
+    fn set_thresholds(env: Env, admin: Address, config: AnomalyConfig) -> Result<(), Error>;
+    fn get_thresholds(env: Env) -> AnomalyConfig;
+    fn check_anomaly(env: Env, user: Address, action: AnomalyAction, amount: i128) -> Result<AnomalyResult, Error>;
+    fn clear_hold(env: Env, user: Address) -> Result<(), Error>;
+    fn is_on_hold(env: Env, user: Address) -> bool;
+    fn get_metrics(env: Env, user: Address) -> UserMetrics;
+    fn get_monitored_user_count(env: Env) -> u32;
+    fn get_monitored_users_page(env: Env, offset: u32, limit: u32) -> Vec<(Address, UserMetrics)>;
+}
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -211,11 +236,21 @@ impl AnomalyDetectorContract {
             }
         }
 
-        // Persist updated metrics
+        // Persist updated metrics with TTL extension (#1265)
         env.storage().persistent().set(&DataKey::Metrics(user.clone()), &metrics);
+        env.storage().persistent().extend_ttl(&DataKey::Metrics(user.clone()), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        // Track user in index for pagination (#1264)
+        if !env.storage().persistent().has(&DataKey::Metrics(user.clone())) {
+            let count: u32 = env.storage().persistent().get(&DataKey::UserCount).unwrap_or(0);
+            env.storage().persistent().set(&DataKey::UserIndex(count), &user.clone());
+            env.storage().persistent().set(&DataKey::UserCount, &(count + 1));
+            env.storage().persistent().extend_ttl(&DataKey::UserCount, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        }
 
         if result == AnomalyResult::Hold {
             env.storage().persistent().set(&DataKey::Hold(user.clone()), &true);
+            env.storage().persistent().extend_ttl(&DataKey::Hold(user.clone()), PERSISTENT_LIFETIME_THRESHOLD, HOLD_TTL);
             emit_anomaly_event(&env, evt_anomaly_hold_placed(&env), (user.clone(), env.ledger().timestamp()));
         } else if result == AnomalyResult::Warning {
             emit_anomaly_event(&env, evt_anomaly_detected(&env), (user.clone(), env.ledger().timestamp()));
@@ -236,6 +271,30 @@ impl AnomalyDetectorContract {
         emit_anomaly_event(&env, evt_anomaly_hold_cleared(&env), (user.clone(), env.ledger().timestamp()));
 
         Ok(())
+    }
+
+    /// Returns the number of monitored users.
+    pub fn get_monitored_user_count(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::UserCount).unwrap_or(0)
+    }
+
+    /// Returns a paginated list of monitored users with their metrics.
+    /// Offset and limit are used for pagination; limit is clamped to MAX_PAGE_SIZE.
+    pub fn get_monitored_users_page(env: Env, offset: u32, limit: u32) -> Vec<(Address, UserMetrics)> {
+        let now = env.ledger().timestamp();
+        let limit = limit.min(MAX_PAGE_SIZE);
+        let count = Self::get_monitored_user_count(&env);
+
+        let mut result = Vec::new(&env);
+
+        for i in offset..offset.saturating_add(limit).min(count) {
+            if let Some(user) = env.storage().persistent().get::<_, Address>(&DataKey::UserIndex(i)) {
+                let metrics = Self::get_or_default_metrics(&env, &user, now);
+                result.push_back((user, metrics));
+            }
+        }
+
+        result
     }
 
     /// Returns true if the user is currently on hold.
