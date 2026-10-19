@@ -1333,13 +1333,12 @@ pub fn propose_admin_change(env: &Env, current_admin: Address, new_admin: Addres
     }
 
     let proposed_at = env.ledger().timestamp();
-    let accepted_at = proposed_at + MIN_ADMIN_TIMELOCK_SECS;
+    let effective_at = proposed_at + MIN_ADMIN_TIMELOCK_SECS;
 
     let transfer = AdminTransfer {
-        old_admin: current_admin.clone(),
         new_admin: new_admin.clone(),
-        proposed_at,
-        accepted_at,
+        effective_at,
+        status: AdminChangeProposal::Proposed,
     };
 
     env.storage()
@@ -1347,7 +1346,7 @@ pub fn propose_admin_change(env: &Env, current_admin: Address, new_admin: Addres
         .set(&DataKey::PendingAdminTransfer, &transfer);
 
     env.events().publish(
-        (symbol_short!("multisig"), symbol_short!("admin_propose")),
+        (symbol_short!("multisig"), symbol_short!("adm_prop")),
         (current_admin, new_admin),
     );
 
@@ -1365,7 +1364,7 @@ pub fn accept_admin_change(env: &Env, new_admin: Address) -> Result<(), Error> {
         .ok_or(Error::ProposalNotFound)?;
 
     let now = env.ledger().timestamp();
-    if now < transfer.accepted_at {
+    if now < transfer.effective_at {
         return Err(Error::Expired); // Timelock not yet expired
     }
 
@@ -1378,8 +1377,8 @@ pub fn accept_admin_change(env: &Env, new_admin: Address) -> Result<(), Error> {
         .remove(&DataKey::PendingAdminTransfer);
 
     env.events().publish(
-        (symbol_short!("multisig"), symbol_short!("admin_accept")),
-        (transfer.old_admin, new_admin),
+        (symbol_short!("multisig"), symbol_short!("adm_acc")),
+        (transfer.new_admin,),
     );
 
     Ok(())
@@ -1395,8 +1394,8 @@ pub fn cancel_admin_change(env: &Env, current_admin: Address) -> Result<(), Erro
         .get(&DataKey::PendingAdminTransfer)
         .ok_or(Error::ProposalNotFound)?;
 
-    if transfer.old_admin != current_admin {
-        return Err(Error::NotAdmin);
+    if transfer.status != AdminChangeProposal::Proposed {
+        return Err(Error::ProposalNotFound);
     }
 
     env.storage()
@@ -1404,8 +1403,8 @@ pub fn cancel_admin_change(env: &Env, current_admin: Address) -> Result<(), Erro
         .remove(&DataKey::PendingAdminTransfer);
 
     env.events().publish(
-        (symbol_short!("multisig"), symbol_short!("admin_cancel")),
-        (transfer.old_admin, transfer.new_admin),
+        (symbol_short!("multisig"), symbol_short!("adm_canc")),
+        (current_admin, transfer.new_admin),
     );
 
     Ok(())
