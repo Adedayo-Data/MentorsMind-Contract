@@ -126,15 +126,13 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 // ---------------------------------------------------------------------------
 
 #[contractevent]
-#[derive(Clone)]
-struct ScoreUpdatedEvent {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoreUpdatedEvent {
     #[topic]
-    category: Symbol,
-    #[topic]
-    action: Symbol,
-    #[topic]
-    user: Address,
-    score: u32,
+    address: Address,
+    old_score: u32,
+    new_score: u32,
+    reason: Symbol,
 }
 
 #[contract]
@@ -201,6 +199,7 @@ impl CreditScoreContract {
             .validate()
             .map_err(|_| Error::ValidationFailed)?;
 
+        let old_score = env.storage().persistent().get(&DataKey::UserScore(user.clone())).unwrap_or(MIN_SCORE);
         let clamped = score.clamp(MIN_SCORE, MAX_SCORE);
         env.storage()
             .persistent()
@@ -209,10 +208,10 @@ impl CreditScoreContract {
         Self::append_history(&env, user.clone(), clamped, reason.clone());
 
         ScoreUpdatedEvent {
-            category: symbol_short!("score"),
-            action: symbol_short!("set"),
-            user,
-            score: clamped,
+            address: user,
+            old_score,
+            new_score: clamped,
+            reason,
         }
         .publish(&env);
 
@@ -229,6 +228,7 @@ impl CreditScoreContract {
             panic!("Rate limited: once per day");
         }
 
+        let old_score = env.storage().persistent().get(&DataKey::UserScore(user.clone())).unwrap_or(MIN_SCORE);
         let (score, breakdown) = Self::do_compute(env.clone(), user.clone());
 
         Validator::new(&env)
@@ -256,10 +256,10 @@ impl CreditScoreContract {
         Self::append_history(&env, user.clone(), score, symbol_short!("refresh"));
 
         ScoreUpdatedEvent {
-            category: symbol_short!("score"),
-            action: symbol_short!("updated"),
-            user,
-            score,
+            address: user,
+            old_score,
+            new_score: score,
+            reason: symbol_short!("refresh"),
         }
         .publish(&env);
 
