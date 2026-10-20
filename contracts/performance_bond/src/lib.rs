@@ -8,7 +8,7 @@ use soroban_sdk::{
 use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
     key_min_bond, key_cooldown_days,
-    DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS,
+    DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS, ReentrancyGuard,
     validate_amount_limits, MAX_FINANCIAL_AMOUNT,
     pagination::Pagination,
 };
@@ -199,6 +199,7 @@ impl PerformanceBondContract {
     ///
     /// Auth: mentor must authorize this call.
     pub fn post_bond(env: Env, mentor: Address, amount: i128) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOND"));
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
@@ -461,6 +462,7 @@ impl PerformanceBondContract {
     ///
     /// Auth: mentor must authorize this call.
     pub fn release_bond(env: Env, mentor: Address) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("BOND"));
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
