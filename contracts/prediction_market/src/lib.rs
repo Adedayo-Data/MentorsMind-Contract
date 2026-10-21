@@ -3,6 +3,7 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
+use shared::pause_guard::require_not_paused;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -76,6 +77,7 @@ pub enum DataKey {
     ResolutionOracle(u32), // Stores the oracle address for a market
     ResolutionProof(u32),  // Stores the cryptographic proof for market resolution
     OracleVote(u32, Address), // Tracks oracle votes for multi-oracle consensus (market_id, oracle_address)
+    PauseGuardian,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +212,26 @@ impl PredictionMarket {
         env.storage().instance().set(&DataKey::MarketCount, &0u32);
     }
 
+    /// Admin-only: set or update the pause-guardian contract address.
+    pub fn set_pause_guardian(env: Env, admin: Address, guardian: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
+    }
+
+    pub fn get_pause_guardian(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PauseGuardian)
+    }
+
     /// Create a new prediction market with LMSR AMM.
     /// liquidity_parameter: higher = less slippage, lower efficiency. Default: 0.1
     /// resolution_oracle: Address of the oracle responsible for resolving this market
@@ -276,6 +298,14 @@ impl PredictionMarket {
     /// Place a bet on market outcome using LMSR pricing.
     /// Cost = C(new_state) - C(old_state) where C is LMSR cost function.
     pub fn place_bet(env: Env, bettor: Address, market_id: u32, outcome: bool, amount: i128) {
+        if let Some(guardian) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         if amount <= 0 {
             panic!("invalid amount");
         }
@@ -354,6 +384,14 @@ impl PredictionMarket {
     /// Resolve market with outcome and cryptographic proof (oracle only)
     /// outcome_proof: BytesN<32> hash of evidence supporting the resolution
     pub fn resolve_market(env: Env, market_id: u32, outcome: bool, outcome_proof: BytesN<32>) {
+        if let Some(guardian) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let mut market: MarketRecord = env
             .storage()
             .instance()
@@ -846,5 +884,124 @@ mod tests {
         client.initialize(&admin);
 
         client.create_market(&creator, &learner, &hash, &0, &token, &None, &oracle, &false);
+    }
+
+    #[contract]
+    pub struct MockPauseGuardian;
+
+    #[contractimpl]
+    impl MockPauseGuardian {
+        pub fn set_paused(env: Env, paused: bool) {
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("PAUSED"), &paused);
+        }
+
+        pub fn is_paused(env: Env) -> bool {
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("PAUSED"))
+                .unwrap_or(false)
+        }
+    }
+
+    #[test]
+    fn test_pause_blocks_place_bet() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PredictionMarket);
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let guardian_id = env.register_contract(None, MockPauseGuardian);
+        let guardian = MockPauseGuardianClient::new(&env, &guardian_id);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let bettor = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.set_pause_guardian(&admin, &guardian_id);
+
+        let market_id = client.create_market(
+            &creator,
+            &learner,
+            &hash,
+            &1000,
+            &token,
+            &None,
+            &oracle,
+            &false,
+        );
+
+        guardian.set_paused(&true);
+        let result = client.try_place_bet(&bettor, &market_id, &true, &100);
+        assert!(result.is_err(), "paused market must block place_bet");
+
+        guardian.set_paused(&false);
+        client.place_bet(&bettor, &market_id, &true, &100);
+        let (yes_pool, _) = client.get_odds(&market_id);
+        assert_eq!(yes_pool, 100);
+    }
+
+    #[test]
+    fn test_pause_blocks_resolve_market() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PredictionMarket);
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let guardian_id = env.register_contract(None, MockPauseGuardian);
+        let guardian = MockPauseGuardianClient::new(&env, &guardian_id);
+
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let hash = BytesN::<32>::from_array(&env, &[0u8; 32]);
+        let proof = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.set_pause_guardian(&admin, &guardian_id);
+
+        let market_id = client.create_market(
+            &creator,
+            &learner,
+            &hash,
+            &100,
+            &token,
+            &None,
+            &oracle,
+            &false,
+        );
+
+        env.ledger().set_timestamp(101);
+
+        guardian.set_paused(&true);
+        let result = client.try_resolve_market(&market_id, &true, &proof);
+        assert!(result.is_err(), "paused market must block resolve_market");
+
+        guardian.set_paused(&false);
+        client.resolve_market(&market_id, &true, &proof);
+        let market = client.get_market(&market_id);
+        assert!(market.resolved);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_set_pause_guardian_rejects_non_admin() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PredictionMarket);
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let guardian_id = env.register_contract(None, MockPauseGuardian);
+
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin);
+        client.set_pause_guardian(&stranger, &guardian_id);
     }
 }
