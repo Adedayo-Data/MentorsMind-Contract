@@ -2,8 +2,9 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol,
-    TryFromVal, Val,
+    TryFromVal, Val, Vec,
 };
+use shared::pagination::{Pagination, MAX_PAGE_SIZE};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +163,31 @@ impl ProposalTemplatesContract {
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
             .expect("proposal not found")
+    }
+
+    pub fn get_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0)
+    }
+
+    pub fn get_proposals_page(env: Env, offset: u32, limit: u32) -> Vec<ProposalRecord> {
+        let count = Self::get_proposal_count(env.clone());
+        let (start, end) = Pagination::bounds(count, offset, limit);
+        let mut page = Vec::new(&env);
+
+        for id in (start + 1)..=end {
+            if let Some(proposal) = env
+                .storage()
+                .persistent()
+                .get::<_, ProposalRecord>(&DataKey::Proposal(id))
+            {
+                page.push_back(proposal);
+            }
+        }
+
+        page
     }
 
     fn require_initialized(env: &Env) {
@@ -343,5 +369,53 @@ mod tests {
         params.set(Symbol::new(&env, "wrong_key"), 250u32.into_val(&env));
 
         client.create_from_template(&proposer, &template, &params);
+    }
+
+    #[test]
+    fn test_pagination_and_proposal_count() {
+        let (env, _admin, client) = setup();
+
+        assert_eq!(client.get_proposal_count(), 0);
+        let empty_page = client.get_proposals_page(&0, &10);
+        assert_eq!(empty_page.len(), 0);
+
+        let template = TemplateType::UpdateFee;
+        let schema_hash = schema_hash_for(&env, &template);
+        client.register_template(&template, &schema_hash);
+
+        let proposer = Address::generate(&env);
+
+        for i in 1..=5 {
+            let mut params = Map::<Symbol, Val>::new(&env);
+            params.set(Symbol::new(&env, "fee_bps"), (i * 100u32).into_val(&env));
+            client.create_from_template(&proposer, &template, &params);
+        }
+
+        assert_eq!(client.get_proposal_count(), 5);
+
+        // Page 1: offset 0, limit 2 -> proposals 1, 2
+        let page1 = client.get_proposals_page(&0, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap().id, 1);
+        assert_eq!(page1.get(1).unwrap().id, 2);
+
+        // Page 2: offset 2, limit 2 -> proposals 3, 4
+        let page2 = client.get_proposals_page(&2, &2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap().id, 3);
+        assert_eq!(page2.get(1).unwrap().id, 4);
+
+        // Page 3: offset 4, limit 2 -> proposal 5 (only 1 remaining)
+        let page3 = client.get_proposals_page(&4, &2);
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3.get(0).unwrap().id, 5);
+
+        // Offset beyond count -> empty
+        let page_past = client.get_proposals_page(&5, &10);
+        assert_eq!(page_past.len(), 0);
+
+        // Clamped to MAX_PAGE_SIZE
+        let all = client.get_proposals_page(&0, &(MAX_PAGE_SIZE + 10));
+        assert_eq!(all.len(), 5);
     }
 }
