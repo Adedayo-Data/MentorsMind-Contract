@@ -78,6 +78,7 @@ pub enum DataKey {
     ResolutionOracle(u32), // Stores the oracle address for a market
     ResolutionProof(u32),  // Stores the cryptographic proof for market resolution
     OracleVote(u32, Address), // Tracks oracle votes for multi-oracle consensus (market_id, oracle_address)
+    PauseGuardian,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +211,26 @@ impl PredictionMarket {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MarketCount, &0u32);
+    }
+
+    /// Admin-only: set or update the pause-guardian contract address.
+    pub fn set_pause_guardian(env: Env, admin: Address, guardian: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if stored_admin != admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
+    }
+
+    pub fn get_pause_guardian(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PauseGuardian)
     }
 
     /// Create a new prediction market with LMSR AMM.
@@ -377,6 +398,14 @@ impl PredictionMarket {
     /// Resolve market with outcome and cryptographic proof (oracle only)
     /// outcome_proof: BytesN<32> hash of evidence supporting the resolution
     pub fn resolve_market(env: Env, market_id: u32, outcome: bool, outcome_proof: BytesN<32>) {
+        if let Some(guardian) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let mut market: MarketRecord = env
             .storage()
             .instance()
