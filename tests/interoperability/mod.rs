@@ -1,3 +1,4 @@
+pub mod delegation_governance;
 pub mod escrow_compliance;
 pub mod escrow_factory;
 pub mod escrow_token;
