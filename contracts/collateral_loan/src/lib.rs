@@ -641,6 +641,19 @@ impl CollateralLoanContract {
         page
     }
 
+    /// Convenience wrapper around `get_undercollateralized_page` that uses the
+    /// `AT_RISK_THRESHOLD_BPS` (140%) to find positions approaching liquidation.
+    ///
+    /// Returns positions where the collateralisation ratio is <= 140%, computed
+    /// against the current oracle price. Liquidation bots use this to identify
+    /// positions that need immediate attention.
+    ///
+    /// `offset` and `limit` address the raw index window (same pagination semantics
+    /// as `get_undercollateralized_page`).
+    pub fn get_at_risk_positions_page(env: Env, offset: u32, limit: u32) -> Vec<CollateralPosition> {
+        Self::get_undercollateralized_page(env, AT_RISK_THRESHOLD_BPS as u32, offset, limit)
+    }
+
     /// Appends `owner` to the dense position index.
     fn index_position(env: &Env, owner: &Address) {
         let count: u32 = env
